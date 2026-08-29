@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import secrets
@@ -9,6 +10,10 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool as pg_pool
 
 from starlette.applications import Starlette
 from starlette.authentication import (
@@ -60,6 +65,122 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 SECRET_FIELDS = {"api_key", "apiKey", "token", "app_secret", "appSecret", "encrypt_key", "encryptKey", "verification_token", "verificationToken"}
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+logger = logging.getLogger("nanobot.server")
+logging.basicConfig(level=logging.INFO)
+
+# --- Postgres-backed persistent memory store ---
+# All 42 replicas share the same nanobot_memory table so agent context and
+# conversation history survive container restarts and are consistent across
+# the cluster. If DATABASE_URL is missing or Postgres is unreachable we fall
+# back to an in-memory dict so the app still boots (single-replica, ephemeral).
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+db_pool: "pg_pool.SimpleConnectionPool | None" = None
+_memory_fallback: dict[str, dict] = {}
+
+
+def init_db_pool():
+    """Create the Postgres connection pool. Returns True on success."""
+    global db_pool
+
+    if not DATABASE_URL:
+        logger.warning(
+            "DATABASE_URL is not set; falling back to in-memory storage. "
+            "Memory will not survive restarts or be shared across replicas."
+        )
+        return False
+
+    try:
+        db_pool = pg_pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+        return True
+    except Exception as e:
+        logger.warning(
+            f"Could not connect to Postgres ({e}); falling back to in-memory storage. "
+            "Memory will not survive restarts or be shared across replicas."
+        )
+        db_pool = None
+        return False
+
+
+def init_db():
+    """Create the nanobot_memory table if it doesn't already exist."""
+    if db_pool is None:
+        return
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS nanobot_memory (
+                    id SERIAL PRIMARY KEY,
+                    key VARCHAR(255) UNIQUE NOT NULL,
+                    value JSONB NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.warning(f"Failed to initialize nanobot_memory table: {e}")
+    finally:
+        db_pool.putconn(conn)
+
+
+def load_memory(key: str) -> dict | None:
+    """Load JSON memory for a given key from Postgres (or fallback dict)."""
+    if db_pool is None:
+        return _memory_fallback.get(key)
+
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT value FROM nanobot_memory WHERE key = %s", (key,))
+            row = cur.fetchone()
+            return row["value"] if row else None
+    except Exception as e:
+        logger.warning(f"Failed to load memory for key '{key}': {e}")
+        return _memory_fallback.get(key)
+    finally:
+        db_pool.putconn(conn)
+
+
+def save_memory(key: str, value: dict) -> None:
+    """Save/upsert JSON memory for a given key into Postgres (or fallback dict)."""
+    if db_pool is None:
+        _memory_fallback[key] = value
+        return
+
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nanobot_memory (key, value, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (key)
+                DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, json.dumps(value)),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.warning(f"Failed to save memory for key '{key}': {e}")
+        _memory_fallback[key] = value
+    finally:
+        db_pool.putconn(conn)
+
+
+def close_db_pool():
+    global db_pool
+    if db_pool is not None:
+        try:
+            db_pool.closeall()
+        except Exception:
+            pass
+        db_pool = None
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -231,10 +352,23 @@ class GatewayManager:
             return
         self.state = "starting"
         try:
+            # Pass DATABASE_URL (and related connection config) through to the
+            # gateway subprocess so agents can read/write shared memory
+            # directly in Postgres, without needing to proxy through this
+            # process.
+            gateway_env = os.environ.copy()
+            if DATABASE_URL:
+                gateway_env["DATABASE_URL"] = DATABASE_URL
+                gateway_env["NANOBOT_MEMORY_BACKEND"] = "postgres"
+                gateway_env["NANOBOT_MEMORY_TABLE"] = "nanobot_memory"
+            else:
+                gateway_env["NANOBOT_MEMORY_BACKEND"] = "memory"
+
             self.process = await asyncio.create_subprocess_exec(
                 "nanobot", "gateway",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=gateway_env,
             )
             self.state = "running"
             self.start_time = time.time()
@@ -346,6 +480,32 @@ async def homepage(request: Request):
 
 async def health(request: Request):
     return JSONResponse({"status": "ok", "gateway": gateway.state})
+
+
+async def api_memory_get(request: Request):
+    """Retrieve persisted agent/conversation context by key from Postgres."""
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    key = request.path_params["key"]
+    value = await asyncio.to_thread(load_memory, key)
+    if value is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"key": key, "value": value})
+
+
+async def api_memory_put(request: Request):
+    """Store/update agent context, shared across all replicas via Postgres."""
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    key = request.path_params["key"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    await asyncio.to_thread(save_memory, key, body)
+    return JSONResponse({"ok": True})
 
 
 async def api_config_get(request: Request):
@@ -502,10 +662,16 @@ async def auto_start_gateway():
 @asynccontextmanager
 async def lifespan(app: Starlette):
     # Startup
+    # Set up the Postgres-backed memory store first so it's available to all
+    # routes (and to the gateway subprocess) before the gateway is started.
+    await asyncio.to_thread(init_db_pool)
+    await asyncio.to_thread(init_db)
+
     await auto_start_gateway()
     yield
     # Shutdown
     await gateway.stop()
+    await asyncio.to_thread(close_db_pool)
 
 
 routes = [
@@ -518,6 +684,8 @@ routes = [
     Route("/api/gateway/start", api_gateway_start, methods=["POST"]),
     Route("/api/gateway/stop", api_gateway_stop, methods=["POST"]),
     Route("/api/gateway/restart", api_gateway_restart, methods=["POST"]),
+    Route("/api/memory/{key}", api_memory_get, methods=["GET"]),
+    Route("/api/memory/{key}", api_memory_put, methods=["PUT"]),
 ]
 
 app = Starlette(
