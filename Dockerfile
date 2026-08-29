@@ -14,6 +14,11 @@ RUN apt-get update && \
 COPY requirements.txt /app/requirements.txt
 RUN uv pip install --system --no-cache "nanobot-ai[discord,wecom,weixin,matrix]" -r /app/requirements.txt
 
+# Pre-baked dev/QA tooling so runtime pip/npm installs survive redeploys (2026-08-29)
+RUN uv pip install --system --no-cache \
+        ruff bandit mypy black flake8 pytest scipy pandas fal-client \
+    && npm install -g --no-fund --no-audit typescript eslint vitest prettier
+
 RUN mkdir -p /data/.nanobot
 
 COPY server.py /app/server.py
