@@ -19,14 +19,11 @@ RUN uv pip install --system --no-cache \
         ruff bandit mypy black flake8 pytest scipy pandas fal-client \
     && npm install -g --no-fund --no-audit typescript eslint vitest prettier
 
-RUN mkdir -p /data/.nanobot
 
 COPY server.py /app/server.py
 COPY templates/ /app/templates/
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
-ENV HOME=/data
-ENV NANOBOT_AGENTS__DEFAULTS__WORKSPACE=/data/.nanobot/workspace
 
 CMD ["/app/start.sh"]
