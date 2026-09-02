@@ -579,7 +579,8 @@ async def api_status(request: Request):
 
     channels = {}
     for name, chan in data["channels"].items():
-        channels[name] = {"enabled": chan.get("enabled", False)}
+        if isinstance(chan, dict):
+            channels[name] = {"enabled": chan.get("enabled", False)}
 
     cron_dir = Path.home() / ".nanobot" / "cron"
     cron_jobs = []
